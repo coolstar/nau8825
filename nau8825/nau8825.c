@@ -648,6 +648,14 @@ Nau8825EvtDeviceAdd(
 	Nau8825Print(DEBUG_LEVEL_INFO, DBG_PNP,
 		"Nau8825EvtDeviceAdd called\n");
 
+	//
+	// Tell framework this is a filter driver. Filter drivers by default are  
+	// not power policy owners. This works well for this driver because
+	// HIDclass driver is the power policy owner for HID minidrivers.
+	//
+
+	WdfFdoInitSetFilter(DeviceInit);
+
 	{
 		WDF_PNPPOWER_EVENT_CALLBACKS pnpCallbacks;
 		WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpCallbacks);
