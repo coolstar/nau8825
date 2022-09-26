@@ -537,6 +537,179 @@ static bool nau8825_is_jack_inserted(PNAU8825_CONTEXT pDevice) {
 	return active_high == is_high;
 }
 
+static void nau8825_configure_mclk_as_sysclk(PNAU8825_CONTEXT pDevice)
+{
+	nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER,
+		NAU8825_CLK_SRC_MASK, NAU8825_CLK_SRC_MCLK);
+	nau8825_reg_update(pDevice, NAU8825_REG_FLL6,
+		NAU8825_DCO_EN, 0);
+	/* Make DSP operate as default setting for power saving. */
+	nau8825_reg_update(pDevice, NAU8825_REG_FLL1,
+		NAU8825_ICTRL_LATCH_MASK, 0);
+}
+
+/**
+ * nau8825_enable_jack_detect - Specify a jack for event reporting
+ *
+ * @component:  component to register the jack with
+ * @jack: jack to use to report headset and button events on
+ *
+ * After this function has been called the headset insert/remove and button
+ * events will be routed to the given jack.  Jack can be null to stop
+ * reporting.
+ */
+NTSTATUS nau8825_enable_jack_detect(PNAU8825_CONTEXT pDevice)
+{
+	/* Ground HP Outputs[1:0], needed for headset auto detection
+	 * Enable Automatic Mic/Gnd switching reading on insert interrupt[6]
+	 */
+	nau8825_reg_update(pDevice, NAU8825_REG_HSD_CTRL,
+		NAU8825_HSD_AUTO_MODE | NAU8825_SPKR_DWN1R | NAU8825_SPKR_DWN1L,
+		NAU8825_HSD_AUTO_MODE | NAU8825_SPKR_DWN1R | NAU8825_SPKR_DWN1L);
+
+	return STATUS_SUCCESS;
+}
+
+static void nau8825_restart_jack_detection(PNAU8825_CONTEXT pDevice)
+{
+	/* this will restart the entire jack detection process including MIC/GND
+	 * switching and create interrupts. We have to go from 0 to 1 and back
+	 * to 0 to restart.
+	 */
+	nau8825_reg_update(pDevice, NAU8825_REG_JACK_DET_CTRL,
+		NAU8825_JACK_DET_RESTART, NAU8825_JACK_DET_RESTART);
+	nau8825_reg_update(pDevice, NAU8825_REG_JACK_DET_CTRL,
+		NAU8825_JACK_DET_RESTART, 0);
+}
+
+static NTSTATUS nau8825_configure_sysclk(PNAU8825_CONTEXT pDevice, int clk_id,
+	unsigned int freq)
+{
+	NTSTATUS status;
+
+	switch (clk_id) {
+	case NAU8825_CLK_DIS:
+		/* Clock provided externally and disable internal VCO clock */
+		nau8825_configure_mclk_as_sysclk(pDevice);
+		break;
+	case NAU8825_CLK_MCLK:
+		/* Acquire the semaphore to synchronize the playback and
+		 * interrupt handler. In order to avoid the playback inter-
+		 * fered by cross talk process, the driver make the playback
+		 * preparation halted until cross talk process finish.
+		 */
+		nau8825_configure_mclk_as_sysclk(pDevice);
+		/* MCLK not changed by clock tree */
+		nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER,
+			NAU8825_CLK_MCLK_SRC_MASK, 0);
+
+		break;
+	case NAU8825_CLK_INTERNAL:
+		if (nau8825_is_jack_inserted(pDevice)) {
+			nau8825_reg_update(pDevice, NAU8825_REG_FLL6,
+				NAU8825_DCO_EN, NAU8825_DCO_EN);
+			nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER,
+				NAU8825_CLK_SRC_MASK, NAU8825_CLK_SRC_VCO);
+			/* Decrease the VCO frequency and make DSP operate
+			 * as default setting for power saving.
+			 */
+			nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER,
+				NAU8825_CLK_MCLK_SRC_MASK, 0xf);
+			nau8825_reg_update(pDevice, NAU8825_REG_FLL1,
+				NAU8825_ICTRL_LATCH_MASK |
+				NAU8825_FLL_RATIO_MASK, 0x10);
+			nau8825_reg_update(pDevice, NAU8825_REG_FLL6,
+				NAU8825_SDM_EN, NAU8825_SDM_EN);
+		}
+		else {
+			/* The clock turns off intentionally for power saving
+			 * when no headset connected.
+			 */
+			nau8825_configure_mclk_as_sysclk(pDevice);
+			DbgPrint("Disable clock for power saving when no headset connected\n");
+		}
+		break;
+	case NAU8825_CLK_FLL_MCLK:
+		/* Higher FLL reference input frequency can only set lower
+		 * gain error, such as 0000 for input reference from MCLK
+		 * 12.288Mhz.
+		 */
+		nau8825_reg_update(pDevice, NAU8825_REG_FLL3,
+			NAU8825_FLL_CLK_SRC_MASK | NAU8825_GAIN_ERR_MASK,
+			NAU8825_FLL_CLK_SRC_MCLK | 0);
+
+		break;
+	case NAU8825_CLK_FLL_BLK:
+		/* If FLL reference input is from low frequency source,
+		 * higher error gain can apply such as 0xf which has
+		 * the most sensitive gain error correction threshold,
+		 * Therefore, FLL has the most accurate DCO to
+		 * target frequency.
+		 */
+		nau8825_reg_update(pDevice, NAU8825_REG_FLL3,
+			NAU8825_FLL_CLK_SRC_MASK | NAU8825_GAIN_ERR_MASK,
+			NAU8825_FLL_CLK_SRC_BLK |
+			(0xf << NAU8825_GAIN_ERR_SFT));
+		break;
+	case NAU8825_CLK_FLL_FS:
+		/* If FLL reference input is from low frequency source,
+		 * higher error gain can apply such as 0xf which has
+		 * the most sensitive gain error correction threshold,
+		 * Therefore, FLL has the most accurate DCO to
+		 * target frequency.
+		 */
+		nau8825_reg_update(pDevice, NAU8825_REG_FLL3,
+			NAU8825_FLL_CLK_SRC_MASK | NAU8825_GAIN_ERR_MASK,
+			NAU8825_FLL_CLK_SRC_FS |
+			(0xf << NAU8825_GAIN_ERR_SFT));
+		break;
+	default:
+		DbgPrint("Invalid clock id (%d)\n", clk_id);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+
+	DbgPrint("Sysclk is %dHz and clock id is %d\n", freq,
+		clk_id);
+	return STATUS_SUCCESS;
+}
+
+/* Enable audo mode interruptions with internal clock. */
+static void nau8825_setup_auto_irq(PNAU8825_CONTEXT pDevice)
+{
+	/* Enable headset jack type detection complete interruption and
+	 * jack ejection interruption.
+	 */
+	nau8825_reg_update(pDevice, NAU8825_REG_INTERRUPT_MASK,
+		NAU8825_IRQ_HEADSET_COMPLETE_EN | NAU8825_IRQ_EJECT_EN, 0);
+
+	/* Enable internal VCO needed for interruptions */
+	nau8825_configure_sysclk(pDevice, NAU8825_CLK_INTERNAL, 0);
+
+	/* Enable ADC needed for interruptions */
+	nau8825_reg_update(pDevice, NAU8825_REG_ENA_CTRL,
+		NAU8825_ENABLE_ADC, NAU8825_ENABLE_ADC);
+
+	/* Chip needs one FSCLK cycle in order to generate interruptions,
+	 * as we cannot guarantee one will be provided by the system. Turning
+	 * master mode on then off enables us to generate that FSCLK cycle
+	 * with a minimum of contention on the clock bus.
+	 */
+	nau8825_reg_update(pDevice, NAU8825_REG_I2S_PCM_CTRL2,
+		NAU8825_I2S_MS_MASK, NAU8825_I2S_MS_MASTER);
+	nau8825_reg_update(pDevice, NAU8825_REG_I2S_PCM_CTRL2,
+		NAU8825_I2S_MS_MASK, NAU8825_I2S_MS_SLAVE);
+
+	/* Not bypass de-bounce circuit */
+	nau8825_reg_update(pDevice, NAU8825_REG_JACK_DET_CTRL,
+		NAU8825_JACK_DET_DB_BYPASS, 0);
+
+	/* Unmask all interruptions */
+	nau8825_reg_write(pDevice, NAU8825_REG_INTERRUPT_DIS_CTRL, 0);
+
+	/* Restart the jack detection process at auto mode */
+	nau8825_restart_jack_detection(pDevice);
+}
+
 static int nau8825_button_decode(int value)
 {
 	int buttons = 0;
@@ -545,6 +718,115 @@ static int nau8825_button_decode(int value)
 	buttons = value & 0xF;
 
 	return buttons;
+}
+
+static void nau8825_int_status_clear_all(PNAU8825_CONTEXT pDevice)
+{
+	int active_irq, clear_irq, i;
+
+	/* Reset the intrruption status from rightmost bit if the corres-
+	 * ponding irq event occurs.
+	 */
+	nau8825_reg_read(pDevice, NAU8825_REG_IRQ_STATUS, &active_irq);
+	for (i = 0; i < NAU8825_REG_DATA_LEN; i++) {
+		clear_irq = (0x1 << i);
+		if (active_irq & clear_irq)
+			nau8825_reg_write(pDevice,
+				NAU8825_REG_INT_CLR_KEY_STATUS, clear_irq);
+	}
+}
+
+static void nau8825_eject_jack(PNAU8825_CONTEXT pDevice)
+{
+
+	/* Detach 2kOhm Resistors from MICBIAS to MICGND1/2 */
+	nau8825_reg_update(pDevice, NAU8825_REG_MIC_BIAS,
+		NAU8825_MICBIAS_JKSLV | NAU8825_MICBIAS_JKR2, 0);
+	/* ground HPL/HPR, MICGRND1/2 */
+	nau8825_reg_update(pDevice, NAU8825_REG_HSD_CTRL, 0xf, 0xf);
+
+	/* Clear all interruption status */
+	nau8825_int_status_clear_all(pDevice);
+
+	/* Enable the insertion interruption, disable the ejection inter-
+	 * ruption, and then bypass de-bounce circuit.
+	 */
+	nau8825_reg_update(pDevice, NAU8825_REG_INTERRUPT_DIS_CTRL,
+		NAU8825_IRQ_EJECT_DIS | NAU8825_IRQ_INSERT_DIS,
+		NAU8825_IRQ_EJECT_DIS);
+	nau8825_reg_update(pDevice, NAU8825_REG_INTERRUPT_MASK,
+		NAU8825_IRQ_OUTPUT_EN | NAU8825_IRQ_EJECT_EN |
+		NAU8825_IRQ_HEADSET_COMPLETE_EN | NAU8825_IRQ_INSERT_EN,
+		NAU8825_IRQ_OUTPUT_EN | NAU8825_IRQ_EJECT_EN |
+		NAU8825_IRQ_HEADSET_COMPLETE_EN);
+	nau8825_reg_update(pDevice, NAU8825_REG_JACK_DET_CTRL,
+		NAU8825_JACK_DET_DB_BYPASS, NAU8825_JACK_DET_DB_BYPASS);
+
+	/* Disable ADC needed for interruptions at audo mode */
+	nau8825_reg_update(pDevice, NAU8825_REG_ENA_CTRL,
+		NAU8825_ENABLE_ADC, 0);
+
+	/* Close clock for jack type detection at manual mode */
+	nau8825_configure_sysclk(pDevice, NAU8825_CLK_DIS, 0);
+}
+
+static int nau8825_jack_insert(PNAU8825_CONTEXT pDevice)
+{
+	int jack_status_reg, mic_detected;
+	int type = 0;
+
+	nau8825_reg_read(pDevice, NAU8825_REG_GENERAL_STATUS, &jack_status_reg);
+	mic_detected = (jack_status_reg >> 10) & 3;
+
+	switch (mic_detected) {
+	case 0:
+		/* no mic */
+		type = SND_JACK_HEADPHONE;
+		break;
+	case 1:
+		DbgPrint("OMTP (micgnd1) mic connected\n");
+		type = SND_JACK_HEADSET;
+
+		/* Unground MICGND1 */
+		nau8825_reg_update(pDevice, NAU8825_REG_HSD_CTRL, 3 << 2,
+			1 << 2);
+		/* Attach 2kOhm Resistor from MICBIAS to MICGND1 */
+		nau8825_reg_update(pDevice, NAU8825_REG_MIC_BIAS,
+			NAU8825_MICBIAS_JKSLV | NAU8825_MICBIAS_JKR2,
+			NAU8825_MICBIAS_JKR2);
+		/* Attach SARADC to MICGND1 */
+		nau8825_reg_update(pDevice, NAU8825_REG_SAR_CTRL,
+			NAU8825_SAR_INPUT_MASK,
+			NAU8825_SAR_INPUT_JKR2);
+		break;
+	case 2:
+		DbgPrint("CTIA (micgnd2) mic connected\n");
+		type = SND_JACK_HEADSET;
+
+		/* Unground MICGND2 */
+		nau8825_reg_update(pDevice, NAU8825_REG_HSD_CTRL, 3 << 2,
+			2 << 2);
+		/* Attach 2kOhm Resistor from MICBIAS to MICGND2 */
+		nau8825_reg_update(pDevice, NAU8825_REG_MIC_BIAS,
+			NAU8825_MICBIAS_JKSLV | NAU8825_MICBIAS_JKR2,
+			NAU8825_MICBIAS_JKSLV);
+		/* Attach SARADC to MICGND2 */
+		nau8825_reg_update(pDevice, NAU8825_REG_SAR_CTRL,
+			NAU8825_SAR_INPUT_MASK,
+			NAU8825_SAR_INPUT_JKSLV);
+		break;
+	case 3:
+		/* detect error case */
+		DbgPrint("detection error; disable mic function\n");
+		type = SND_JACK_HEADPHONE;
+		break;
+	}
+
+	/* Leaving HPOL/R grounded after jack insert by default. They will be
+	 * ungrounded as part of the widget power up sequence at the beginning
+	 * of playback to reduce pop.
+	 */
+	return type;
 }
 
 BOOLEAN OnInterruptIsr(
@@ -567,6 +849,8 @@ BOOLEAN OnInterruptIsr(
 
 	if ((active_irq & NAU8825_JACK_EJECTION_IRQ_MASK) ==
 		NAU8825_JACK_EJECTION_DETECTED) {
+
+		nau8825_eject_jack(pDevice);
 
 		CsAudioSpecialKeyReport report;
 		report.ReportID = REPORTID_SPECKEYS;
@@ -603,7 +887,7 @@ BOOLEAN OnInterruptIsr(
 			CsAudioSpecialKeyReport report;
 			report.ReportID = REPORTID_SPECKEYS;
 			report.ControlCode = CONTROL_CODE_JACK_TYPE;
-			report.ControlValue = SND_JACK_HEADSET;
+			report.ControlValue = nau8825_jack_insert(pDevice);
 
 			size_t bytesWritten;
 			Nau8825ProcessVendorReport(pDevice, &report, sizeof(report), &bytesWritten);
@@ -615,7 +899,24 @@ BOOLEAN OnInterruptIsr(
 	}
 	else if ((active_irq & NAU8825_JACK_INSERTION_IRQ_MASK) ==
 		NAU8825_JACK_INSERTION_DETECTED) {
-		//Nothing to do
+		/* One more step to check GPIO status directly. Thus, the
+		 * driver can confirm the real insertion interruption because
+		 * the intrruption at manual mode has bypassed debounce
+		 * circuit which can get rid of unstable status.
+		 */
+		if (nau8825_is_jack_inserted(pDevice)) {
+			/* Turn off insertion interruption at manual mode */
+			nau8825_reg_update(pDevice,
+				NAU8825_REG_INTERRUPT_DIS_CTRL,
+				NAU8825_IRQ_INSERT_DIS,
+				NAU8825_IRQ_INSERT_DIS);
+			nau8825_reg_update(pDevice, NAU8825_REG_INTERRUPT_MASK,
+				NAU8825_IRQ_INSERT_EN, NAU8825_IRQ_INSERT_EN);
+			/* Enable interruption for jack type detection at audo
+			 * mode which can detect microphone and jack type.
+			 */
+			nau8825_setup_auto_irq(pDevice);
+		}
 	}
 
 	if (!clear_irq)
