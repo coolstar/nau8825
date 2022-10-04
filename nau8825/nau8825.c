@@ -262,6 +262,69 @@ static void nau8825_setup_buttons(PNAU8825_CONTEXT pDevice) {
 		0);
 }
 
+static bool nau8825_is_jack_inserted(PNAU8825_CONTEXT pDevice) {
+	bool active_high, is_high;
+	int status, jkdet;
+
+	nau8825_reg_read(pDevice, NAU8825_REG_JACK_DET_CTRL, &jkdet);
+	active_high = jkdet & NAU8825_JACK_POLARITY;
+	nau8825_reg_read(pDevice, NAU8825_REG_I2C_DEVICE_ID, &status);
+	is_high = status & NAU8825_GPIO2JD1;
+	/* return jack connection status according to jack insertion logic
+	 * active high or active low.
+	 */
+	return active_high == is_high;
+}
+
+static void nau8825_configure_mclk_as_sysclk(PNAU8825_CONTEXT pDevice)
+{
+	nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER,
+		NAU8825_CLK_SRC_MASK, NAU8825_CLK_SRC_MCLK);
+	nau8825_reg_update(pDevice, NAU8825_REG_FLL6,
+		NAU8825_DCO_EN, 0);
+	/* Make DSP operate as default setting for power saving. */
+	nau8825_reg_update(pDevice, NAU8825_REG_FLL1,
+		NAU8825_ICTRL_LATCH_MASK, 0);
+}
+
+/**
+ * nau8825_enable_jack_detect - Specify a jack for event reporting
+ *
+ * @component:  component to register the jack with
+ * @jack: jack to use to report headset and button events on
+ *
+ * After this function has been called the headset insert/remove and button
+ * events will be routed to the given jack.  Jack can be null to stop
+ * reporting.
+ */
+NTSTATUS nau8825_enable_jack_detect(PNAU8825_CONTEXT pDevice)
+{
+	/* Ground HP Outputs[1:0], needed for headset auto detection
+	 * Enable Automatic Mic/Gnd switching reading on insert interrupt[6]
+	 */
+	nau8825_reg_update(pDevice, NAU8825_REG_HSD_CTRL,
+		NAU8825_HSD_AUTO_MODE | NAU8825_SPKR_DWN1R | NAU8825_SPKR_DWN1L,
+		NAU8825_HSD_AUTO_MODE | NAU8825_SPKR_DWN1R | NAU8825_SPKR_DWN1L);
+
+	return STATUS_SUCCESS;
+}
+
+void nau8825_int_status_clear_all(PNAU8825_CONTEXT pDevice)
+{
+	int active_irq, clear_irq, i;
+
+	/* Reset the intrruption status from rightmost bit if the corres-
+	 * ponding irq event occurs.
+	 */
+	nau8825_reg_read(pDevice, NAU8825_REG_IRQ_STATUS, &active_irq);
+	for (i = 0; i < NAU8825_REG_DATA_LEN; i++) {
+		clear_irq = (0x1 << i);
+		if (active_irq & clear_irq)
+			nau8825_reg_write(pDevice,
+				NAU8825_REG_INT_CLR_KEY_STATUS, clear_irq);
+	}
+}
+
 static void nau8825_init_regs(PNAU8825_CONTEXT pDevice) {
 	RtlZeroMemory(&pDevice->sar_threshold, sizeof(pDevice->sar_threshold));
 
@@ -383,40 +446,42 @@ static void nau8825_init_regs(PNAU8825_CONTEXT pDevice) {
 	nau8825_reg_update(pDevice, NAU8825_REG_LEFT_TIME_SLOT,
 		NAU8825_DIS_FS_SHORT_DET, NAU8825_DIS_FS_SHORT_DET);
 
-	{ //Set sane defaults from Chrome OS
-		nau8825_reg_write(pDevice, NAU8825_REG_ENA_CTRL, 0x07ff);
+	{
+		//Resume setup
 
-		nau8825_reg_write(pDevice, NAU8825_REG_CLK_DIVIDER, 0x809f);
-		nau8825_reg_write(pDevice, NAU8825_REG_FLL1, 0x1810);
-		nau8825_reg_write(pDevice, NAU8825_REG_FLL2, 0x0000);
-		nau8825_reg_write(pDevice, NAU8825_REG_FLL3, 0xfca0);
-		nau8825_reg_write(pDevice, NAU8825_REG_FLL5, 0x1000);
-		nau8825_reg_write(pDevice, NAU8825_REG_FLL6, 0x0000);
+		/* Clock provided externally and disable internal VCO clock */
+		nau8825_configure_mclk_as_sysclk(pDevice);
 
-		nau8825_reg_write(pDevice, NAU8825_REG_HSD_CTRL, 0x0048);
-		nau8825_reg_write(pDevice, NAU8825_REG_INTERRUPT_MASK, 0x0b5b);
+		nau8825_int_status_clear_all(pDevice);
 
-		nau8825_reg_write(pDevice, NAU8825_REG_INTERRUPT_DIS_CTRL, 0x0000);
-		nau8825_reg_write(pDevice, NAU8825_REG_SAR_CTRL, 0x1e15);
+		/* Enable both insertion and ejection interruptions, and then
+		 * bypass de-bounce circuit.
+		 */
+		nau8825_reg_update(pDevice, NAU8825_REG_INTERRUPT_MASK,
+			NAU8825_IRQ_OUTPUT_EN | NAU8825_IRQ_HEADSET_COMPLETE_EN |
+			NAU8825_IRQ_EJECT_EN | NAU8825_IRQ_INSERT_EN,
+			NAU8825_IRQ_OUTPUT_EN | NAU8825_IRQ_HEADSET_COMPLETE_EN);
+		nau8825_reg_update(pDevice, NAU8825_REG_JACK_DET_CTRL,
+			NAU8825_JACK_DET_DB_BYPASS, NAU8825_JACK_DET_DB_BYPASS);
+		nau8825_reg_update(pDevice, NAU8825_REG_INTERRUPT_DIS_CTRL,
+			NAU8825_IRQ_INSERT_DIS | NAU8825_IRQ_EJECT_DIS, 0);
+	}
 
-		nau8825_reg_write(pDevice, NAU8825_REG_I2S_PCM_CTRL1, 0x000a);
+	nau8825_enable_jack_detect(pDevice);
 
-		nau8825_reg_write(pDevice, NAU8825_REG_DAC_CTRL1, 0x0082);
+	{
+		//Set sane defaults from Linux
+		nau8825_reg_update(pDevice, NAU8825_REG_ENA_CTRL, 0x0700, 0x0700); //nothing running is 0x013f, headphones is 0x077f, both running is 0x07ff
 
-		nau8825_reg_write(pDevice, NAU8825_REG_ADC_DGAIN_CTRL, 0x00ff);
+		nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER, 0xf0, 0x90);
 
-		nau8825_reg_write(pDevice, NAU8825_REG_CLASSG_CTRL, 0x2007);
+		nau8825_reg_update(pDevice, NAU8825_REG_INTERRUPT_MASK, 0xf, 0xe);
 
-		nau8825_reg_write(pDevice, NAU8825_REG_BIAS_ADJ, 0x0060);
+		nau8825_reg_update(pDevice, NAU8825_REG_I2S_PCM_CTRL1, 0xf, 0xa);
 
-		nau8825_reg_write(pDevice, NAU8825_REG_ANALOG_ADC_2, 0x0060);
-		nau8825_reg_write(pDevice, NAU8825_REG_RDAC, 0x332c);
-		nau8825_reg_write(pDevice, NAU8825_REG_MIC_BIAS, 0x4106);
+		nau8825_reg_update(pDevice, NAU8825_REG_ADC_DGAIN_CTRL, 0xf0, 0xf0);
 
-		nau8825_reg_write(pDevice, NAU8825_REG_BOOST, 0x3140);
-
-		nau8825_reg_write(pDevice, NAU8825_REG_POWER_UP_CONTROL, 0x533f);
-		nau8825_reg_write(pDevice, NAU8825_REG_CHARGE_PUMP, 0x0420);
+		nau8825_reg_update(pDevice, NAU8825_REG_CHARGE_PUMP, 0xf00, 0x300);
 	}
 }
 
@@ -523,53 +588,6 @@ Status
 	return STATUS_SUCCESS;
 }
 
-static bool nau8825_is_jack_inserted(PNAU8825_CONTEXT pDevice) {
-	bool active_high, is_high;
-	int status, jkdet;
-
-	nau8825_reg_read(pDevice, NAU8825_REG_JACK_DET_CTRL, &jkdet);
-	active_high = jkdet & NAU8825_JACK_POLARITY;
-	nau8825_reg_read(pDevice, NAU8825_REG_I2C_DEVICE_ID, &status);
-	is_high = status & NAU8825_GPIO2JD1;
-	/* return jack connection status according to jack insertion logic
-	 * active high or active low.
-	 */
-	return active_high == is_high;
-}
-
-static void nau8825_configure_mclk_as_sysclk(PNAU8825_CONTEXT pDevice)
-{
-	nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER,
-		NAU8825_CLK_SRC_MASK, NAU8825_CLK_SRC_MCLK);
-	nau8825_reg_update(pDevice, NAU8825_REG_FLL6,
-		NAU8825_DCO_EN, 0);
-	/* Make DSP operate as default setting for power saving. */
-	nau8825_reg_update(pDevice, NAU8825_REG_FLL1,
-		NAU8825_ICTRL_LATCH_MASK, 0);
-}
-
-/**
- * nau8825_enable_jack_detect - Specify a jack for event reporting
- *
- * @component:  component to register the jack with
- * @jack: jack to use to report headset and button events on
- *
- * After this function has been called the headset insert/remove and button
- * events will be routed to the given jack.  Jack can be null to stop
- * reporting.
- */
-NTSTATUS nau8825_enable_jack_detect(PNAU8825_CONTEXT pDevice)
-{
-	/* Ground HP Outputs[1:0], needed for headset auto detection
-	 * Enable Automatic Mic/Gnd switching reading on insert interrupt[6]
-	 */
-	nau8825_reg_update(pDevice, NAU8825_REG_HSD_CTRL,
-		NAU8825_HSD_AUTO_MODE | NAU8825_SPKR_DWN1R | NAU8825_SPKR_DWN1L,
-		NAU8825_HSD_AUTO_MODE | NAU8825_SPKR_DWN1R | NAU8825_SPKR_DWN1L);
-
-	return STATUS_SUCCESS;
-}
-
 static void nau8825_restart_jack_detection(PNAU8825_CONTEXT pDevice)
 {
 	/* this will restart the entire jack detection process including MIC/GND
@@ -626,7 +644,7 @@ static NTSTATUS nau8825_configure_sysclk(PNAU8825_CONTEXT pDevice, int clk_id,
 			 * when no headset connected.
 			 */
 			nau8825_configure_mclk_as_sysclk(pDevice);
-			DbgPrint("Disable clock for power saving when no headset connected\n");
+			Nau8825Print(DEBUG_LEVEL_INFO, DBG_IOCTL, "Disable clock for power saving when no headset connected\n");
 		}
 		break;
 	case NAU8825_CLK_FLL_MCLK:
@@ -664,11 +682,11 @@ static NTSTATUS nau8825_configure_sysclk(PNAU8825_CONTEXT pDevice, int clk_id,
 			(0xf << NAU8825_GAIN_ERR_SFT));
 		break;
 	default:
-		DbgPrint("Invalid clock id (%d)\n", clk_id);
+		Nau8825Print(DEBUG_LEVEL_ERROR, DBG_IOCTL, "Invalid clock id (%d)\n", clk_id);
 		return STATUS_INVALID_DEVICE_STATE;
 	}
 
-	DbgPrint("Sysclk is %dHz and clock id is %d\n", freq,
+	Nau8825Print(DEBUG_LEVEL_INFO, DBG_IOCTL, "Sysclk is %dHz and clock id is %d\n", freq,
 		clk_id);
 	return STATUS_SUCCESS;
 }
@@ -720,24 +738,42 @@ static int nau8825_button_decode(int value)
 	return buttons;
 }
 
-static void nau8825_int_status_clear_all(PNAU8825_CONTEXT pDevice)
-{
-	int active_irq, clear_irq, i;
-
-	/* Reset the intrruption status from rightmost bit if the corres-
-	 * ponding irq event occurs.
-	 */
-	nau8825_reg_read(pDevice, NAU8825_REG_IRQ_STATUS, &active_irq);
-	for (i = 0; i < NAU8825_REG_DATA_LEN; i++) {
-		clear_irq = (0x1 << i);
-		if (active_irq & clear_irq)
-			nau8825_reg_write(pDevice,
-				NAU8825_REG_INT_CLR_KEY_STATUS, clear_irq);
-	}
-}
-
 static void nau8825_eject_jack(PNAU8825_CONTEXT pDevice)
 {
+	{
+		//Unset 2nd defaults set from Linux
+		nau8825_reg_update(pDevice, NAU8825_REG_SAR_CTRL, NAU8825_SAR_ADC_EN, 0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_CLASSG_CTRL, NAU8825_CLASSG_LDAC_EN | NAU8825_CLASSG_RDAC_EN | NAU8825_CLASSG_EN, 0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_BIAS_ADJ, NAU8825_BIAS_TESTDAC_EN, NAU8825_BIAS_TESTDAC_EN);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_ANALOG_ADC_2, NAU8825_POWERUP_ADCL, 0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_RDAC, NAU8825_RDAC_EN | NAU8825_RDAC_CLK_EN, 0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_MIC_BIAS,
+			(1 << 8),
+			(0 << 8)); //Disable Mic Bias
+
+		nau8825_reg_update(pDevice, NAU8825_REG_BOOST, NAU8825_HP_BOOST_DIS, NAU8825_HP_BOOST_DIS);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_POWER_UP_CONTROL,
+			NAU8825_POWERUP_INTEGR_R | NAU8825_POWERUP_INTEGR_L | NAU8825_POWERUP_DRV_IN_R | NAU8825_POWERUP_DRV_IN_L | NAU8825_POWERUP_HP_DRV_R | NAU8825_POWERUP_HP_DRV_L,
+			0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_POWER_UP_CONTROL,
+			(1 << 14),
+			(0 << 14)); //Frontend PGA Disable
+
+		nau8825_reg_update(pDevice, NAU8825_REG_CHARGE_PUMP,
+			NAU8825_JAMNODCLOW | NAU8825_CHANRGE_PUMP_EN,
+			0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_CHARGE_PUMP,
+			NAU8825_POWER_DOWN_DACR | NAU8825_POWER_DOWN_DACL,
+			NAU8825_POWER_DOWN_DACR | NAU8825_POWER_DOWN_DACL);
+	}
 
 	/* Detach 2kOhm Resistors from MICBIAS to MICGND1/2 */
 	nau8825_reg_update(pDevice, NAU8825_REG_MIC_BIAS,
@@ -784,7 +820,7 @@ static int nau8825_jack_insert(PNAU8825_CONTEXT pDevice)
 		type = SND_JACK_HEADPHONE;
 		break;
 	case 1:
-		DbgPrint("OMTP (micgnd1) mic connected\n");
+		Nau8825Print(DEBUG_LEVEL_INFO, DBG_IOCTL, "OMTP (micgnd1) mic connected\n");
 		type = SND_JACK_HEADSET;
 
 		/* Unground MICGND1 */
@@ -800,7 +836,7 @@ static int nau8825_jack_insert(PNAU8825_CONTEXT pDevice)
 			NAU8825_SAR_INPUT_JKR2);
 		break;
 	case 2:
-		DbgPrint("CTIA (micgnd2) mic connected\n");
+		Nau8825Print(DEBUG_LEVEL_INFO, DBG_IOCTL, "CTIA (micgnd2) mic connected\n");
 		type = SND_JACK_HEADSET;
 
 		/* Unground MICGND2 */
@@ -820,6 +856,51 @@ static int nau8825_jack_insert(PNAU8825_CONTEXT pDevice)
 		DbgPrint("detection error; disable mic function\n");
 		type = SND_JACK_HEADPHONE;
 		break;
+	} 
+
+	{
+		//Set 2nd defaults set from Linux
+		nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER, NAU8825_CLK_SRC_MASK | NAU8825_CLK_MCLK_SRC_MASK, 0x0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_FLL6, NAU8825_DCO_EN, 0x0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_HSD_CTRL, NAU8825_SPKR_DWN1R | NAU8825_SPKR_DWN1L, 0x0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_SAR_CTRL, NAU8825_SAR_ADC_EN, NAU8825_SAR_ADC_EN);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_I2S_PCM_CTRL2, NAU8825_I2S_TRISTATE, 0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_DAC_CTRL1, NAU8825_DAC_OVERSAMPLE_MASK, NAU8825_DAC_OVERSAMPLE_128);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_CLASSG_CTRL, NAU8825_CLASSG_LDAC_EN | NAU8825_CLASSG_RDAC_EN | NAU8825_CLASSG_EN, NAU8825_CLASSG_LDAC_EN | NAU8825_CLASSG_RDAC_EN | NAU8825_CLASSG_EN);
+	
+		nau8825_reg_update(pDevice, NAU8825_REG_BIAS_ADJ, NAU8825_BIAS_TESTDAC_EN, 0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_ANALOG_ADC_2, NAU8825_POWERUP_ADCL, NAU8825_POWERUP_ADCL);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_RDAC, NAU8825_RDAC_EN | NAU8825_RDAC_CLK_EN, NAU8825_RDAC_EN | NAU8825_RDAC_CLK_EN);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_MIC_BIAS,
+			(1 << 8),
+			(1 << 8)); //Enable Mic Bias
+
+		nau8825_reg_update(pDevice, NAU8825_REG_BOOST, NAU8825_HP_BOOST_DIS, 0);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_POWER_UP_CONTROL,
+			NAU8825_POWERUP_INTEGR_R | NAU8825_POWERUP_INTEGR_L | NAU8825_POWERUP_DRV_IN_R | NAU8825_POWERUP_DRV_IN_L | NAU8825_POWERUP_HP_DRV_R | NAU8825_POWERUP_HP_DRV_L,
+			NAU8825_POWERUP_INTEGR_R | NAU8825_POWERUP_INTEGR_L | NAU8825_POWERUP_DRV_IN_R | NAU8825_POWERUP_DRV_IN_L | NAU8825_POWERUP_HP_DRV_R | NAU8825_POWERUP_HP_DRV_L);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_POWER_UP_CONTROL,
+			(1 << 14),
+			(1 << 14)); //Frontend PGA Enable
+
+		nau8825_reg_update(pDevice, NAU8825_REG_CHARGE_PUMP,
+			NAU8825_JAMNODCLOW | NAU8825_CHANRGE_PUMP_EN,
+			NAU8825_JAMNODCLOW | NAU8825_CHANRGE_PUMP_EN);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_CHARGE_PUMP,
+			NAU8825_POWER_DOWN_DACR | NAU8825_POWER_DOWN_DACL,
+			0);
 	}
 
 	/* Leaving HPOL/R grounded after jack insert by default. They will be
