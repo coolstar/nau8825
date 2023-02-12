@@ -221,6 +221,195 @@ Status
 	return status;
 }
 
+static NTSTATUS GetIntegerProperty(
+	_In_ WDFDEVICE FxDevice,
+	char* propertyStr,
+	UINT8* property
+) {
+	PNAU8825_CONTEXT pDevice = GetDeviceContext(FxDevice);
+	WDFMEMORY outputMemory = WDF_NO_HANDLE;
+
+	NTSTATUS status = STATUS_ACPI_NOT_INITIALIZED;
+
+	size_t inputBufferLen = sizeof(ACPI_GET_DEVICE_SPECIFIC_DATA) + strlen(propertyStr) + 1;
+	ACPI_GET_DEVICE_SPECIFIC_DATA* inputBuffer = ExAllocatePoolWithTag(NonPagedPool, inputBufferLen, NAU8825_POOL_TAG);
+	if (!inputBuffer) {
+		goto Exit;
+	}
+	RtlZeroMemory(inputBuffer, inputBufferLen);
+
+	inputBuffer->Signature = IOCTL_ACPI_GET_DEVICE_SPECIFIC_DATA_SIGNATURE;
+
+	unsigned char uuidend[] = { 0x8a, 0x91, 0xbc, 0x9b, 0xbf, 0x4a, 0xa3, 0x01 };
+
+	inputBuffer->Section.Data1 = 0xdaffd814;
+	inputBuffer->Section.Data2 = 0x6eba;
+	inputBuffer->Section.Data3 = 0x4d8c;
+	memcpy(inputBuffer->Section.Data4, uuidend, sizeof(uuidend)); //Avoid Windows defender false positive
+
+	strcpy(inputBuffer->PropertyName, propertyStr);
+	inputBuffer->PropertyNameLength = strlen(propertyStr) + 1;
+
+	PACPI_EVAL_OUTPUT_BUFFER outputBuffer;
+	size_t outputArgumentBufferSize = 8;
+	size_t outputBufferSize = FIELD_OFFSET(ACPI_EVAL_OUTPUT_BUFFER, Argument) + sizeof(ACPI_METHOD_ARGUMENT_V1) + outputArgumentBufferSize;
+	sizeof(ACPI_EVAL_OUTPUT_BUFFER_V1);
+
+	WDF_OBJECT_ATTRIBUTES attributes;
+	WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+	attributes.ParentObject = FxDevice;
+	status = WdfMemoryCreate(&attributes,
+		NonPagedPoolNx,
+		0,
+		outputBufferSize,
+		&outputMemory,
+		&outputBuffer);
+	if (!NT_SUCCESS(status)) {
+		goto Exit;
+	}
+
+	WDF_MEMORY_DESCRIPTOR inputMemDesc;
+	WDF_MEMORY_DESCRIPTOR outputMemDesc;
+	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&inputMemDesc, inputBuffer, (ULONG)inputBufferLen);
+	WDF_MEMORY_DESCRIPTOR_INIT_HANDLE(&outputMemDesc, outputMemory, NULL);
+
+	status = WdfIoTargetSendInternalIoctlSynchronously(
+		WdfDeviceGetIoTarget(FxDevice),
+		NULL,
+		IOCTL_ACPI_GET_DEVICE_SPECIFIC_DATA,
+		&inputMemDesc,
+		&outputMemDesc,
+		NULL,
+		NULL
+	);
+	if (!NT_SUCCESS(status)) {
+		Nau8825Print(
+			DEBUG_LEVEL_ERROR,
+			DBG_IOCTL,
+			"Error getting device data for key %s - 0x%x\n",
+			propertyStr,
+			status);
+		goto Exit;
+	}
+
+	if (outputBuffer->Signature != ACPI_EVAL_OUTPUT_BUFFER_SIGNATURE_V1 &&
+		outputBuffer->Count < 1 &&
+		outputBuffer->Argument->Type != ACPI_METHOD_ARGUMENT_INTEGER &&
+		outputBuffer->Argument->DataLength < 1) {
+		status = STATUS_ACPI_INVALID_ARGUMENT;
+		goto Exit;
+	}
+
+	if (property) {
+		*property = outputBuffer->Argument->Data[0] & 0xF;
+	}
+
+Exit:
+	if (inputBuffer) {
+		ExFreePoolWithTag(inputBuffer, NAU8825_POOL_TAG);
+	}
+	if (outputMemory != WDF_NO_HANDLE) {
+		WdfObjectDelete(outputMemory);
+	}
+	return status;
+}
+
+static NTSTATUS GetIntegerArrayProperty(
+	_In_ WDFDEVICE FxDevice,
+	char* propertyStr,
+	UINT8 arrayCnt,
+	UINT8 *propertyArray
+) {
+	PNAU8825_CONTEXT pDevice = GetDeviceContext(FxDevice);
+	WDFMEMORY outputMemory = WDF_NO_HANDLE;
+
+	NTSTATUS status = STATUS_ACPI_NOT_INITIALIZED;
+
+	size_t inputBufferLen = sizeof(ACPI_GET_DEVICE_SPECIFIC_DATA) + strlen(propertyStr) + 1;
+	ACPI_GET_DEVICE_SPECIFIC_DATA* inputBuffer = ExAllocatePoolWithTag(NonPagedPool, inputBufferLen, NAU8825_POOL_TAG);
+	if (!inputBuffer) {
+		goto Exit;
+	}
+	RtlZeroMemory(inputBuffer, inputBufferLen);
+
+	inputBuffer->Signature = IOCTL_ACPI_GET_DEVICE_SPECIFIC_DATA_SIGNATURE;
+
+	unsigned char uuidend[] = { 0x8a, 0x91, 0xbc, 0x9b, 0xbf, 0x4a, 0xa3, 0x01 };
+
+	inputBuffer->Section.Data1 = 0xdaffd814;
+	inputBuffer->Section.Data2 = 0x6eba;
+	inputBuffer->Section.Data3 = 0x4d8c;
+	memcpy(inputBuffer->Section.Data4, uuidend, sizeof(uuidend)); //Avoid Windows defender false positive
+
+	strcpy(inputBuffer->PropertyName, propertyStr);
+	inputBuffer->PropertyNameLength = strlen(propertyStr) + 1;
+
+	PACPI_EVAL_OUTPUT_BUFFER outputBuffer;
+	size_t outputArgumentBufferSize = (sizeof(ACPI_METHOD_ARGUMENT_V1) + 4) * arrayCnt;
+	size_t outputBufferSize = FIELD_OFFSET(ACPI_EVAL_OUTPUT_BUFFER, Argument) + outputArgumentBufferSize;
+
+	WDF_OBJECT_ATTRIBUTES attributes;
+	WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+	attributes.ParentObject = FxDevice;
+	status = WdfMemoryCreate(&attributes,
+		NonPagedPoolNx,
+		0,
+		outputBufferSize,
+		&outputMemory,
+		&outputBuffer);
+	if (!NT_SUCCESS(status)) {
+		goto Exit;
+	}
+
+	WDF_MEMORY_DESCRIPTOR inputMemDesc;
+	WDF_MEMORY_DESCRIPTOR outputMemDesc;
+	WDF_MEMORY_DESCRIPTOR_INIT_BUFFER(&inputMemDesc, inputBuffer, (ULONG)inputBufferLen);
+	WDF_MEMORY_DESCRIPTOR_INIT_HANDLE(&outputMemDesc, outputMemory, NULL);
+
+	status = WdfIoTargetSendInternalIoctlSynchronously(
+		WdfDeviceGetIoTarget(FxDevice),
+		NULL,
+		IOCTL_ACPI_GET_DEVICE_SPECIFIC_DATA,
+		&inputMemDesc,
+		&outputMemDesc,
+		NULL,
+		NULL
+	);
+	if (!NT_SUCCESS(status)) {
+		Nau8825Print(
+			DEBUG_LEVEL_ERROR,
+			DBG_IOCTL,
+			"Error getting device data for key %s - 0x%x\n",
+			propertyStr,
+			status);
+		goto Exit;
+	}
+
+	if (outputBuffer->Signature != ACPI_EVAL_OUTPUT_BUFFER_SIGNATURE_V1 &&
+		outputBuffer->Count < arrayCnt &&
+		outputBuffer->Argument->Type != ACPI_METHOD_ARGUMENT_PACKAGE) {
+		status = STATUS_ACPI_INVALID_ARGUMENT;
+		goto Exit;
+	}
+
+	UINT8 i = 0;
+	FOR_EACH_ACPI_METHOD_ARGUMENT(arrParameter, outputBuffer->Argument, (UINT8 *)outputBuffer + outputBuffer->Length){
+		if (propertyArray) {
+			propertyArray[i] = arrParameter->Data[0] & 0xFF;
+		}
+		i++;
+	}
+
+Exit:
+	if (inputBuffer) {
+		ExFreePoolWithTag(inputBuffer, NAU8825_POOL_TAG);
+	}
+	if (outputMemory != WDF_NO_HANDLE) {
+		WdfObjectDelete(outputMemory);
+	}
+	return status;
+}
+
 static void nau8825_reset_chip(PNAU8825_CONTEXT pDevice) {
 	nau8825_reg_write(pDevice, NAU8825_REG_RESET, 0x00);
 	nau8825_reg_write(pDevice, NAU8825_REG_RESET, 0x00);
@@ -325,10 +514,12 @@ void nau8825_int_status_clear_all(PNAU8825_CONTEXT pDevice)
 	}
 }
 
-static void nau8825_init_regs(PNAU8825_CONTEXT pDevice) {
+static NTSTATUS nau8825_load_settings(PNAU8825_CONTEXT pDevice) {
+	NTSTATUS status;
 	RtlZeroMemory(&pDevice->sar_threshold, sizeof(pDevice->sar_threshold));
 
-	pDevice->jkdet_enable = 1;
+	//Default from Lars (for now)
+	/*pDevice->jkdet_enable = 1;
 	pDevice->jkdet_pull_enable = 1;
 	pDevice->jkdet_pull_up = 1;
 	pDevice->jkdet_polarity = 1;
@@ -345,8 +536,79 @@ static void nau8825_init_regs(PNAU8825_CONTEXT pDevice) {
 	pDevice->sar_sampling_time = 1;
 	pDevice->key_debounce = 3;
 	pDevice->jack_insert_debounce = 7;
-	pDevice->jack_eject_debounce = 0;
+	pDevice->jack_eject_debounce = 0;*/
 
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jkdet-enable", &pDevice->jkdet_enable);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jkdet-pull-enable", &pDevice->jkdet_pull_enable);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jkdet-pull-up", &pDevice->jkdet_pull_up);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jkdet-polarity", &pDevice->jkdet_polarity);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,vref-impedance", &pDevice->vref_impedance);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,micbias-voltage", &pDevice->micbias_voltage);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,sar-threshold-num", &pDevice->sar_threshold_num);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+
+	status = GetIntegerArrayProperty(pDevice->FxDevice, "nuvoton,sar-threshold", pDevice->sar_threshold_num, pDevice->sar_threshold);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+
+	//TODO: Get SAR threshold
+
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,sar-hysteresis", &pDevice->sar_hysteresis);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,sar-voltage", &pDevice->sar_voltage);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,sar-compare-time", &pDevice->sar_compare_time);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,sar-sampling-time", &pDevice->sar_sampling_time);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,short-key-debounce", &pDevice->key_debounce);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jack-insert-debounce", &pDevice->jack_insert_debounce);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
+	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jack-eject-debounce", &pDevice->jack_eject_debounce);
+	if (!NT_SUCCESS(status)) {
+		status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jack-eject-deboune", &pDevice->jack_eject_debounce); //Google made a typo lmaooo
+		if (!NT_SUCCESS(status)) {
+			return status;
+		}
+	}
+	return status;
+}
+
+static void nau8825_init_regs(PNAU8825_CONTEXT pDevice) {
 	/* Latch IIC LSB value */
 	nau8825_reg_write(pDevice, NAU8825_REG_IIC_ADDR_SET, 0x0001);
 	/* Enable Bias/Vmid */
@@ -536,7 +798,11 @@ Status
 	UNREFERENCED_PARAMETER(FxPreviousState);
 
 	PNAU8825_CONTEXT pDevice = GetDeviceContext(FxDevice);
-	NTSTATUS status = STATUS_SUCCESS;
+	NTSTATUS status = nau8825_load_settings(pDevice);
+
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
 
 	WDF_OBJECT_ATTRIBUTES attributes;
 	WDF_WORKITEM_CONFIG workitemConfig;

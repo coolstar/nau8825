@@ -16,6 +16,8 @@
 #pragma warning(disable:4214)  // suppress bit field types other than int warning
 #include <hidport.h>
 
+#include <acpiioct.h>
+
 #include "hidcommon.h"
 
 #include <stdint.h>
@@ -117,7 +119,7 @@ typedef struct _NAU8825_CONTEXT
 	UINT8 vref_impedance;
 	UINT8 micbias_voltage;
 	UINT8 sar_threshold_num;
-	UINT8 sar_threshold[7];
+	UINT8 sar_threshold[8];
 	UINT8 sar_hysteresis;
 	UINT8 sar_voltage;
 	UINT8 sar_compare_time;
