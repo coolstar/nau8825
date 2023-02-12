@@ -7,6 +7,10 @@
 static ULONG Nau8825DebugLevel = 100;
 static ULONG Nau8825DebugCatagories = DBG_INIT || DBG_PNP || DBG_IOCTL;
 
+void nau8825_update_reclock(PNAU8825_CONTEXT pDevice);
+NTSTATUS nau8825_configure_sysclk(PNAU8825_CONTEXT pDevice, int clk_id,
+	unsigned int freq);
+
 NTSTATUS
 DriverEntry(
 	__in PDRIVER_OBJECT  DriverObject,
@@ -42,6 +46,49 @@ DriverEntry(
 	}
 
 	return status;
+}
+
+typedef enum platform {
+	PlatformNone,
+	PlatformRyzen,
+	PlatformSkylake,
+	PlatformAlderLake
+} Platform;
+
+static Platform GetPlatform() {
+	int cpuinfo[4];
+	__cpuidex(cpuinfo, 0, 0);
+
+	int temp = cpuinfo[2];
+	cpuinfo[2] = cpuinfo[3];
+	cpuinfo[3] = temp;
+
+	char vendorName[13];
+	RtlZeroMemory(vendorName, 13);
+	memcpy(vendorName, &cpuinfo[1], 12);
+
+	__cpuidex(cpuinfo, 1, 0);
+
+	UINT16 family = (cpuinfo[0] >> 8) & 0xF;
+	UINT8 model = (cpuinfo[0] >> 4) & 0xF;
+	UINT8 stepping = cpuinfo[0] & 0xF;
+	if (family == 0xF || family == 0x6) {
+		model += (((cpuinfo[0] >> 16) & 0xF) << 4);
+	}
+	if (family == 0xF) {
+		family += (cpuinfo[0] >> 20) & 0xFF;
+	}
+
+	if (strcmp(vendorName, "AuthenticAMD") == 0) {
+		return PlatformRyzen; //family 23 for Picasso / Dali
+	}
+	else if (strcmp(vendorName, "GenuineIntel") == 0) {
+		if (model == 78)
+			return PlatformSkylake;
+		else
+			return PlatformAlderLake;
+	}
+	return PlatformNone;
 }
 
 NTSTATUS nau8825_reg_read(
@@ -91,6 +138,23 @@ NTSTATUS nau8825_reg_update(
 		status = nau8825_reg_write(pDevice, reg, tmp);
 	}
 	return status;
+}
+
+int CsAudioArg2 = 1;
+
+VOID
+CSAudioRegisterEndpoint(
+	PNAU8825_CONTEXT pDevice
+) {
+	CsAudioArg arg;
+	RtlZeroMemory(&arg, sizeof(CsAudioArg));
+	arg.argSz = sizeof(CsAudioArg);
+	arg.endpointType = CSAudioEndpointTypeHeadphone;
+	arg.endpointRequest = CSAudioEndpointRegister;
+	ExNotifyCallback(pDevice->CSAudioAPICallback, &arg, &CsAudioArg2);
+
+	arg.endpointType = CSAudioEndpointTypeMicJack;
+	ExNotifyCallback(pDevice->CSAudioAPICallback, &arg, &CsAudioArg2); //register both in case user decides to record first
 }
 
 NTSTATUS
@@ -187,6 +251,11 @@ Status
 		return status;
 	}
 
+	//Defaults for skylake
+	pDevice->bclkRate = 48000;
+	pDevice->freq = 48000;
+	pDevice->validBits = 24;
+
 	return status;
 }
 
@@ -217,6 +286,16 @@ Status
 	UNREFERENCED_PARAMETER(FxResourcesTranslated);
 
 	SpbTargetDeinitialize(FxDevice, &pDevice->I2CContext);
+
+	if (pDevice->CSAudioAPICallbackObj) {
+		ExUnregisterCallback(pDevice->CSAudioAPICallbackObj);
+		pDevice->CSAudioAPICallbackObj = NULL;
+	}
+
+	if (pDevice->CSAudioAPICallback) {
+		ObfDereferenceObject(pDevice->CSAudioAPICallback);
+		pDevice->CSAudioAPICallback = NULL;
+	}
 
 	return status;
 }
@@ -538,18 +617,10 @@ static NTSTATUS nau8825_load_settings(PNAU8825_CONTEXT pDevice) {
 	pDevice->jack_insert_debounce = 7;
 	pDevice->jack_eject_debounce = 0;*/
 
-	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jkdet-enable", &pDevice->jkdet_enable);
-	if (!NT_SUCCESS(status)) {
-		return status;
-	}
-	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jkdet-pull-enable", &pDevice->jkdet_pull_enable);
-	if (!NT_SUCCESS(status)) {
-		return status;
-	}
-	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jkdet-pull-up", &pDevice->jkdet_pull_up);
-	if (!NT_SUCCESS(status)) {
-		return status;
-	}
+	pDevice->jkdet_enable = 1;
+	pDevice->jkdet_pull_enable = 1;
+	pDevice->jkdet_pull_up = 1;
+
 	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jkdet-polarity", &pDevice->jkdet_polarity);
 	if (!NT_SUCCESS(status)) {
 		return status;
@@ -598,13 +669,7 @@ static NTSTATUS nau8825_load_settings(PNAU8825_CONTEXT pDevice) {
 	if (!NT_SUCCESS(status)) {
 		return status;
 	}
-	status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jack-eject-debounce", &pDevice->jack_eject_debounce);
-	if (!NT_SUCCESS(status)) {
-		status = GetIntegerProperty(pDevice->FxDevice, "nuvoton,jack-eject-deboune", &pDevice->jack_eject_debounce); //Google made a typo lmaooo
-		if (!NT_SUCCESS(status)) {
-			return status;
-		}
-	}
+	GetIntegerProperty(pDevice->FxDevice, "nuvoton,jack-eject-debounce", &pDevice->jack_eject_debounce);
 	return status;
 }
 
@@ -729,48 +794,318 @@ static void nau8825_init_regs(PNAU8825_CONTEXT pDevice) {
 			NAU8825_IRQ_INSERT_DIS | NAU8825_IRQ_EJECT_DIS, 0);
 	}
 
-	nau8825_enable_jack_detect(pDevice);
+	if (GetPlatform() == PlatformAlderLake) {
+		nau8825_configure_sysclk(pDevice, NAU8825_CLK_FLL_BLK, 0);
+	}
+
+	nau8825_update_reclock(pDevice);
 
 	{
 		//Set sane defaults from Linux
 		nau8825_reg_update(pDevice, NAU8825_REG_ENA_CTRL, 0x0700, 0x0700); //nothing running is 0x013f, headphones is 0x077f, both running is 0x07ff
 
-		nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER, 0xf0, 0x90);
-
 		nau8825_reg_update(pDevice, NAU8825_REG_INTERRUPT_MASK, 0xf, 0xe);
 
-		nau8825_reg_update(pDevice, NAU8825_REG_I2S_PCM_CTRL1, 0xf, 0xa);
+		if (GetPlatform() == PlatformAlderLake) {
+			nau8825_reg_update(pDevice, NAU8825_REG_ADC_DGAIN_CTRL, 0xff, 0xe6);
 
-		nau8825_reg_update(pDevice, NAU8825_REG_ADC_DGAIN_CTRL, 0xf0, 0xf0);
+			nau8825_reg_update(pDevice, NAU8825_REG_POWER_UP_CONTROL, 0x1f00, 0x1800);
+		} else {
+			nau8825_reg_update(pDevice, NAU8825_REG_ADC_DGAIN_CTRL, 0xff, 0xff);
+		}
 
 		nau8825_reg_update(pDevice, NAU8825_REG_CHARGE_PUMP, 0xf00, 0x300);
+	}
+
+	nau8825_enable_jack_detect(pDevice);
+}
+
+#define NAU_FREF_MAX 13500000
+#define NAU_FVCO_MAX 124000000
+#define NAU_FVCO_MIN 90000000
+
+struct nau8825_fll {
+	int mclk_src;
+	int ratio;
+	int fll_frac;
+	int fll_int;
+	int clk_ref_div;
+};
+
+struct nau8825_fll_attr {
+	unsigned int param;
+	unsigned int val;
+};
+
+/* scaling for mclk from sysclk_src output */
+static const struct nau8825_fll_attr mclk_src_scaling[] = {
+	{ 1, 0x0 },
+	{ 2, 0x2 },
+	{ 4, 0x3 },
+	{ 8, 0x4 },
+	{ 16, 0x5 },
+	{ 32, 0x6 },
+	{ 3, 0x7 },
+	{ 6, 0xa },
+	{ 12, 0xb },
+	{ 24, 0xc },
+	{ 48, 0xd },
+	{ 96, 0xe },
+	{ 5, 0xf },
+};
+
+/* ratio for input clk freq */
+static const struct nau8825_fll_attr fll_ratio[] = {
+	{ 512000, 0x01 },
+	{ 256000, 0x02 },
+	{ 128000, 0x04 },
+	{ 64000, 0x08 },
+	{ 32000, 0x10 },
+	{ 8000, 0x20 },
+	{ 4000, 0x40 },
+};
+
+static const struct nau8825_fll_attr fll_pre_scalar[] = {
+	{ 1, 0x0 },
+	{ 2, 0x1 },
+	{ 4, 0x2 },
+	{ 8, 0x3 },
+};
+
+/**
+ * nau8825_calc_fll_param - Calculate FLL parameters.
+ * @fll_in: external clock provided to codec.
+ * @fs: sampling rate.
+ * @fll_param: Pointer to structure of FLL parameters.
+ *
+ * Calculate FLL parameters to configure codec.
+ *
+ * Returns 0 for success or negative error code.
+ */
+static NTSTATUS nau8825_calc_fll_param(unsigned int fll_in, unsigned int fs,
+	struct nau8825_fll* fll_param)
+{
+	UINT64 fvco, fvco_max;
+	unsigned int fref, i, fvco_sel;
+
+	/* Ensure the reference clock frequency (FREF) is <= 13.5MHz by dividing
+	 * freq_in by 1, 2, 4, or 8 using FLL pre-scalar.
+	 * FREF = freq_in / NAU8825_FLL_REF_DIV_MASK
+	 */
+	for (i = 0; i < ARRAYSIZE(fll_pre_scalar); i++) {
+		fref = fll_in / fll_pre_scalar[i].param;
+		if (fref <= NAU_FREF_MAX)
+			break;
+	}
+	if (i == ARRAYSIZE(fll_pre_scalar))
+		return STATUS_INVALID_PARAMETER;
+	fll_param->clk_ref_div = fll_pre_scalar[i].val;
+
+	/* Choose the FLL ratio based on FREF */
+	for (i = 0; i < ARRAYSIZE(fll_ratio); i++) {
+		if (fref >= fll_ratio[i].param)
+			break;
+	}
+	if (i == ARRAYSIZE(fll_ratio))
+		return STATUS_INVALID_PARAMETER;
+	fll_param->ratio = fll_ratio[i].val;
+
+	/* Calculate the frequency of DCO (FDCO) given freq_out = 256 * Fs.
+	 * FDCO must be within the 90MHz - 124MHz or the FFL cannot be
+	 * guaranteed across the full range of operation.
+	 * FDCO = freq_out * 2 * mclk_src_scaling
+	 */
+	fvco_max = 0;
+	fvco_sel = ARRAYSIZE(mclk_src_scaling);
+	for (i = 0; i < ARRAYSIZE(mclk_src_scaling); i++) {
+		fvco = 256ULL * fs * 2 * mclk_src_scaling[i].param;
+		if (fvco > NAU_FVCO_MIN && fvco < NAU_FVCO_MAX &&
+			fvco_max < fvco) {
+			fvco_max = fvco;
+			fvco_sel = i;
+		}
+	}
+	if (ARRAYSIZE(mclk_src_scaling) == fvco_sel)
+		return STATUS_INVALID_PARAMETER;
+	fll_param->mclk_src = mclk_src_scaling[fvco_sel].val;
+
+	/* Calculate the FLL 10-bit integer input and the FLL 16-bit fractional
+	 * input based on FDCO, FREF and FLL ratio.
+	 */
+	fvco = (fvco_max << 16) / ((UINT64)fref * (UINT64)fll_param->ratio);
+	fll_param->fll_int = (fvco >> 16) & 0x3FF;
+	fll_param->fll_frac = fvco & 0xFFFF;
+	return STATUS_SUCCESS;
+}
+
+static void nau8825_fll_apply(PNAU8825_CONTEXT pDevice,
+	struct nau8825_fll* fll_param)
+{
+	nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER,
+		NAU8825_CLK_SRC_MASK | NAU8825_CLK_MCLK_SRC_MASK,
+		NAU8825_CLK_SRC_MCLK | fll_param->mclk_src);
+	/* Make DSP operate at high speed for better performance. */
+	nau8825_reg_update(pDevice, NAU8825_REG_FLL1,
+		NAU8825_FLL_RATIO_MASK | NAU8825_ICTRL_LATCH_MASK,
+		fll_param->ratio | (0x6 << NAU8825_ICTRL_LATCH_SFT));
+	/* FLL 16-bit fractional input */
+	nau8825_reg_write(pDevice, NAU8825_REG_FLL2, fll_param->fll_frac);
+	/* FLL 10-bit integer input */
+	nau8825_reg_update(pDevice, NAU8825_REG_FLL3,
+		NAU8825_FLL_INTEGER_MASK, fll_param->fll_int);
+	/* FLL pre-scaler */
+	nau8825_reg_update(pDevice, NAU8825_REG_FLL4,
+		NAU8825_FLL_REF_DIV_MASK,
+		fll_param->clk_ref_div << NAU8825_FLL_REF_DIV_SFT);
+	/* select divided VCO input */
+	nau8825_reg_update(pDevice, NAU8825_REG_FLL5,
+		NAU8825_FLL_CLK_SW_MASK, NAU8825_FLL_CLK_SW_REF);
+	/* Disable free-running mode */
+	nau8825_reg_update(pDevice,
+		NAU8825_REG_FLL6, NAU8825_DCO_EN, 0);
+	if (fll_param->fll_frac) {
+		/* set FLL loop filter enable and cutoff frequency at 500Khz */
+		nau8825_reg_update(pDevice, NAU8825_REG_FLL5,
+			NAU8825_FLL_PDB_DAC_EN | NAU8825_FLL_LOOP_FTR_EN |
+			NAU8825_FLL_FTR_SW_MASK,
+			NAU8825_FLL_PDB_DAC_EN | NAU8825_FLL_LOOP_FTR_EN |
+			NAU8825_FLL_FTR_SW_FILTER);
+		nau8825_reg_update(pDevice, NAU8825_REG_FLL6,
+			NAU8825_SDM_EN | NAU8825_CUTOFF500,
+			NAU8825_SDM_EN | NAU8825_CUTOFF500);
+	}
+	else {
+		/* disable FLL loop filter and cutoff frequency */
+		nau8825_reg_update(pDevice, NAU8825_REG_FLL5,
+			NAU8825_FLL_PDB_DAC_EN | NAU8825_FLL_LOOP_FTR_EN |
+			NAU8825_FLL_FTR_SW_MASK, NAU8825_FLL_FTR_SW_ACCU);
+		nau8825_reg_update(pDevice, NAU8825_REG_FLL6,
+			NAU8825_SDM_EN | NAU8825_CUTOFF500, 0);
+	}
+}
+
+void nau8825_update_reclock(PNAU8825_CONTEXT pDevice) {
+	if (pDevice->ReclockRequested) {
+		struct nau8825_fll fll_param;
+		int fs = pDevice->freq;
+
+		NTSTATUS status = nau8825_calc_fll_param(pDevice->bclkRate, fs, &fll_param);
+		if (!NT_SUCCESS(status)) {
+			DbgPrint("Failed to calculate parameters\n");
+			return status;
+		}
+
+		nau8825_fll_apply(pDevice, &fll_param);
+
+		nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER,
+			NAU8825_CLK_SRC_MASK, NAU8825_CLK_SRC_VCO);			
+	}
+
+	nau8825_reg_update(pDevice, NAU8825_REG_I2S_PCM_CTRL1, NAU8825_I2S_DF_MASK, NAU8825_I2S_DF_I2S);
+
+	switch (pDevice->validBits) {
+	case 16:
+		nau8825_reg_update(pDevice, NAU8825_REG_I2S_PCM_CTRL1, NAU8825_I2S_DL_MASK, NAU8825_I2S_DL_16);
+		break;
+	case 20:
+		nau8825_reg_update(pDevice, NAU8825_REG_I2S_PCM_CTRL1, NAU8825_I2S_DL_MASK, NAU8825_I2S_DL_20);
+		break;
+	case 32:
+		nau8825_reg_update(pDevice, NAU8825_REG_I2S_PCM_CTRL1, NAU8825_I2S_DL_MASK, NAU8825_I2S_DL_32);
+		break;
+	default:
+	case 24:
+		nau8825_reg_update(pDevice, NAU8825_REG_I2S_PCM_CTRL1, NAU8825_I2S_DL_MASK, NAU8825_I2S_DL_24);
 	}
 }
 
 VOID
-NAU8825BootWorkItem(
-	IN WDFWORKITEM  WorkItem
-)
-{
-	WDFDEVICE Device = (WDFDEVICE)WdfWorkItemGetParentObject(WorkItem);
-	PNAU8825_CONTEXT pDevice = GetDeviceContext(Device);
-
-	nau8825_reset_chip(pDevice);
-	int value;
-	NTSTATUS status = nau8825_reg_read(pDevice, NAU8825_REG_I2C_DEVICE_ID, &value);
-
-	if ((value & NAU8825_SOFTWARE_ID_MASK) !=
-		NAU8825_SOFTWARE_ID_NAU8825) {
-		DbgPrint("Not a NAU8825 chip\n");
+CsAudioCallbackFunction(
+	IN PNAU8825_CONTEXT pDevice,
+	CsAudioArg* arg,
+	PVOID Argument2
+) {
+	if (!pDevice) {
 		return;
 	}
 
-	nau8825_init_regs(pDevice);
+	if (Argument2 == &CsAudioArg2) {
+		return;
+	}
 
-	pDevice->DevicePoweredOn = TRUE;
+	pDevice->CSAudioManaged = TRUE;
 
-end:
-	WdfObjectDelete(WorkItem);
+	CsAudioArg localArg;
+	RtlZeroMemory(&localArg, sizeof(CsAudioArg));
+	RtlCopyMemory(&localArg, arg, min(arg->argSz, sizeof(CsAudioArg)));
+
+	if (localArg.endpointType == CSAudioEndpointTypeDSP && localArg.endpointRequest == CSAudioEndpointRegister) {
+		CSAudioRegisterEndpoint(pDevice);
+	}
+	else if (localArg.endpointType != CSAudioEndpointTypeHeadphone &&
+		localArg.endpointType != CSAudioEndpointTypeMicJack) { //check both in case user decides to record first
+		return;
+	}
+
+	if (localArg.endpointRequest == CSAudioEndpointI2SParameters &&
+		localArg.i2sParameters.version >= 1) { //Supports version 1 or higher
+
+		//Reclock requested
+		UINT32 bclk_rate = localArg.i2sParameters.bclk_rate;
+		UINT32 freq = localArg.i2sParameters.frequency;
+		UINT32 validBits = localArg.i2sParameters.valid_bits;
+
+		if (!pDevice->ReclockRequested) {
+			pDevice->bclkRate = bclk_rate;
+			pDevice->freq = freq;
+			pDevice->validBits = validBits;
+			pDevice->ReclockRequested = TRUE;
+
+			nau8825_reset_chip(pDevice);
+			nau8825_init_regs(pDevice);
+		}
+	}
+}
+
+NTSTATUS
+OnSelfManagedIoInit(
+	_In_
+	WDFDEVICE FxDevice
+) {
+	PNAU8825_CONTEXT pDevice = GetDeviceContext(FxDevice);
+	NTSTATUS status = STATUS_SUCCESS;
+
+	// CS Audio Callback
+
+	UNICODE_STRING CSAudioCallbackAPI;
+	RtlInitUnicodeString(&CSAudioCallbackAPI, L"\\CallBack\\CsAudioCallbackAPI");
+
+
+	OBJECT_ATTRIBUTES attributes;
+	InitializeObjectAttributes(&attributes,
+		&CSAudioCallbackAPI,
+		OBJ_KERNEL_HANDLE | OBJ_OPENIF | OBJ_CASE_INSENSITIVE | OBJ_PERMANENT,
+		NULL,
+		NULL
+	);
+	status = ExCreateCallback(&pDevice->CSAudioAPICallback, &attributes, TRUE, TRUE);
+	if (!NT_SUCCESS(status)) {
+
+		return status;
+	}
+
+	pDevice->CSAudioAPICallbackObj = ExRegisterCallback(pDevice->CSAudioAPICallback,
+		CsAudioCallbackFunction,
+		pDevice
+	);
+	if (!pDevice->CSAudioAPICallbackObj) {
+
+		return STATUS_NO_CALLBACK_ACTIVE;
+	}
+
+	CSAudioRegisterEndpoint(pDevice);
+
+	return status;
 }
 
 NTSTATUS
@@ -804,20 +1139,22 @@ Status
 		return status;
 	}
 
-	WDF_OBJECT_ATTRIBUTES attributes;
-	WDF_WORKITEM_CONFIG workitemConfig;
-	WDFWORKITEM hWorkItem;
+	nau8825_reset_chip(pDevice);
+	int value;
+	status = nau8825_reg_read(pDevice, NAU8825_REG_I2C_DEVICE_ID, &value);
+	if (!NT_SUCCESS(status)) {
+		return status;
+	}
 
-	WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
-	WDF_OBJECT_ATTRIBUTES_SET_CONTEXT_TYPE(&attributes, NAU8825_CONTEXT);
-	attributes.ParentObject = pDevice->FxDevice;
-	WDF_WORKITEM_CONFIG_INIT(&workitemConfig, NAU8825BootWorkItem);
+	if ((value & NAU8825_SOFTWARE_ID_MASK) !=
+		NAU8825_SOFTWARE_ID_NAU8825) {
+		DbgPrint("Not a NAU8825 chip\n");
+		return;
+	}
 
-	WdfWorkItemCreate(&workitemConfig,
-		&attributes,
-		&hWorkItem);
+	nau8825_init_regs(pDevice);
 
-	WdfWorkItemEnqueue(hWorkItem);
+	pDevice->DevicePoweredOn = true;
 
 	return status;
 }
@@ -866,7 +1203,7 @@ static void nau8825_restart_jack_detection(PNAU8825_CONTEXT pDevice)
 		NAU8825_JACK_DET_RESTART, 0);
 }
 
-static NTSTATUS nau8825_configure_sysclk(PNAU8825_CONTEXT pDevice, int clk_id,
+NTSTATUS nau8825_configure_sysclk(PNAU8825_CONTEXT pDevice, int clk_id,
 	unsigned int freq)
 {
 	NTSTATUS status;
@@ -1126,9 +1463,14 @@ static int nau8825_jack_insert(PNAU8825_CONTEXT pDevice)
 
 	{
 		//Set 2nd defaults set from Linux
-		nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER, NAU8825_CLK_SRC_MASK | NAU8825_CLK_MCLK_SRC_MASK, 0x0);
+		if (!pDevice->ReclockRequested) {
+			nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER, NAU8825_CLK_SRC_MASK | NAU8825_CLK_MCLK_SRC_MASK, 0x0);
 
-		nau8825_reg_update(pDevice, NAU8825_REG_FLL6, NAU8825_DCO_EN, 0x0);
+			nau8825_reg_update(pDevice, NAU8825_REG_FLL6, NAU8825_DCO_EN, 0x0);
+		}
+		else {
+			nau8825_update_reclock(pDevice);
+		}
 
 		nau8825_reg_update(pDevice, NAU8825_REG_HSD_CTRL, NAU8825_SPKR_DWN1R | NAU8825_SPKR_DWN1L, 0x0);
 
@@ -1136,7 +1478,15 @@ static int nau8825_jack_insert(PNAU8825_CONTEXT pDevice)
 
 		nau8825_reg_update(pDevice, NAU8825_REG_I2S_PCM_CTRL2, NAU8825_I2S_TRISTATE, 0);
 
-		nau8825_reg_update(pDevice, NAU8825_REG_DAC_CTRL1, NAU8825_DAC_OVERSAMPLE_MASK, NAU8825_DAC_OVERSAMPLE_128);
+		if (GetPlatform() == PlatformSkylake)
+		{
+			nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER, NAU8825_CLK_ADC_SRC_MASK | NAU8825_CLK_DAC_SRC_MASK, (2 << NAU8825_CLK_ADC_SRC_SFT) | (1 << NAU8825_CLK_DAC_SRC_SFT));
+			nau8825_reg_update(pDevice, NAU8825_REG_DAC_CTRL1, NAU8825_DAC_OVERSAMPLE_MASK, NAU8825_DAC_OVERSAMPLE_128);
+		}
+		else {
+			nau8825_reg_update(pDevice, NAU8825_REG_CLK_DIVIDER, NAU8825_CLK_ADC_SRC_MASK | NAU8825_CLK_DAC_SRC_MASK, (2 << NAU8825_CLK_ADC_SRC_SFT) | (2 << NAU8825_CLK_DAC_SRC_SFT));
+			nau8825_reg_update(pDevice, NAU8825_REG_DAC_CTRL1, NAU8825_DAC_OVERSAMPLE_MASK, NAU8825_DAC_OVERSAMPLE_64);
+		}
 
 		nau8825_reg_update(pDevice, NAU8825_REG_CLASSG_CTRL, NAU8825_CLASSG_LDAC_EN | NAU8825_CLASSG_RDAC_EN | NAU8825_CLASSG_EN, NAU8825_CLASSG_LDAC_EN | NAU8825_CLASSG_RDAC_EN | NAU8825_CLASSG_EN);
 	
@@ -1185,7 +1535,7 @@ BOOLEAN OnInterruptIsr(
 	PNAU8825_CONTEXT pDevice = GetDeviceContext(Device);
 
 	if (!pDevice->DevicePoweredOn)
-		return true;
+		return false;
 
 	int active_irq, clear_irq = 0, event = 0, event_mask = 0;
 	NTSTATUS status = nau8825_reg_read(pDevice, NAU8825_REG_IRQ_STATUS, &active_irq);
@@ -1310,6 +1660,7 @@ Nau8825EvtDeviceAdd(
 
 		pnpCallbacks.EvtDevicePrepareHardware = OnPrepareHardware;
 		pnpCallbacks.EvtDeviceReleaseHardware = OnReleaseHardware;
+		pnpCallbacks.EvtDeviceSelfManagedIoInit = OnSelfManagedIoInit;
 		pnpCallbacks.EvtDeviceD0Entry = OnD0Entry;
 		pnpCallbacks.EvtDeviceD0Exit = OnD0Exit;
 
