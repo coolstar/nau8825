@@ -1139,6 +1139,8 @@ Status
 		return status;
 	}
 
+	pDevice->JackType = 0;
+
 	nau8825_reset_chip(pDevice);
 	int value;
 	status = nau8825_reg_read(pDevice, NAU8825_REG_I2C_DEVICE_ID, &value);
@@ -1549,10 +1551,12 @@ BOOLEAN OnInterruptIsr(
 
 		nau8825_eject_jack(pDevice);
 
+		pDevice->JackType = 0;
+
 		CsAudioSpecialKeyReport report;
 		report.ReportID = REPORTID_SPECKEYS;
 		report.ControlCode = CONTROL_CODE_JACK_TYPE;
-		report.ControlValue = 0;
+		report.ControlValue = pDevice->JackType;
 
 		size_t bytesWritten;
 		Nau8825ProcessVendorReport(pDevice, &report, sizeof(report), &bytesWritten);
@@ -1581,10 +1585,12 @@ BOOLEAN OnInterruptIsr(
 	}
 	else if (active_irq & NAU8825_HEADSET_COMPLETION_IRQ) {
 		if (nau8825_is_jack_inserted(pDevice)) {
+			pDevice->JackType = nau8825_jack_insert(pDevice);;
+
 			CsAudioSpecialKeyReport report;
 			report.ReportID = REPORTID_SPECKEYS;
 			report.ControlCode = CONTROL_CODE_JACK_TYPE;
-			report.ControlValue = nau8825_jack_insert(pDevice);
+			report.ControlValue = pDevice->JackType;
 
 			size_t bytesWritten;
 			Nau8825ProcessVendorReport(pDevice, &report, sizeof(report), &bytesWritten);
@@ -2230,6 +2236,17 @@ Nau8825WriteReport(
 
 			switch (transferPacket->reportId)
 			{
+			case REPORTID_SPECKEYS:
+				status = STATUS_SUCCESS;
+
+				CsAudioSpecialKeyReport report;
+				report.ReportID = REPORTID_SPECKEYS;
+				report.ControlCode = CONTROL_CODE_JACK_TYPE;
+				report.ControlValue = DevContext->JackType;
+
+				size_t bytesWritten;
+				Nau8825ProcessVendorReport(DevContext, &report, sizeof(report), &bytesWritten);
+				break;
 			default:
 
 				Nau8825Print(DEBUG_LEVEL_ERROR, DBG_IOCTL,
